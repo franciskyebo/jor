@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Station météo IoT — TP 10.3</title>
+<script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+body{font-family:system-ui,sans-serif;margin:0;background:#f1f5f9;color:#0f172a}header{background:#1f3a5f;color:white;padding:16px 24px;display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}.etat{padding:5px 12px;border-radius:999px;font-size:14px;background:#64748b}.etat.ok{background:#15803d}.etat.ko{background:#b91c1c}main{max-width:1100px;margin:24px auto;padding:0 16px}.cartes{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:16px}.carte,.panneau{background:white;border-radius:12px;padding:18px;box-shadow:0 1px 4px #0002}.carte span{display:block;font-size:14px;color:#64748b}.carte b{font-size:32px}.panneau{margin-top:18px}.actions{display:flex;gap:9px;flex-wrap:wrap;align-items:center}button{padding:10px 15px;border:0;border-radius:8px;background:#1f3a5f;color:#fff;cursor:pointer}button:hover{background:#345c88}input{padding:9px 10px;width:100px;border:1px solid #cbd5e1;border-radius:7px}label{display:inline-flex;align-items:center;gap:10px}table{width:100%;border-collapse:collapse;font-size:14px}td,th{padding:8px;border-bottom:1px solid #e2e8f0;text-align:left}.alarme{border:2px solid #dc2626;background:#fee2e2;color:#991b1b;padding:20px;border-radius:12px;margin-bottom:18px;font-weight:700;animation:pulse 1s infinite alternate}.alarme[hidden]{display:none}@keyframes pulse{from{background:#fee2e2}to{background:#fecaca}}.muted{color:#64748b;font-size:13px}.chartbox{height:320px;position:relative}
+</style>
+</head>
+<body>
+<header><h2 style="margin:0">Station météo IoT</h2><div>Station : <span id="station" class="etat">?</span> &nbsp; Broker : <span id="broker" class="etat">connexion...</span></div></header>
+<main>
+<section id="banniere" class="alarme" hidden>🚨 ALARME TEMPÉRATURE — <span id="descriptionAlarme">Seuil dépassé</span> <span id="etatAcquittement"></span></section>
+<section class="cartes">
+<div class="carte"><span>Température</span><b id="t">--</b> °C</div>
+<div class="carte"><span>Humidité</span><b id="h">--</b> %</div>
+<div class="carte"><span>Ressenti</span><b id="hi">--</b> °C</div>
+<div class="carte"><span>Point de rosée</span><b id="dp">--</b> °C</div>
+<div class="carte"><span>Luminosité (relative)</span><b id="lum">--</b> %</div>
+</section>
+<section class="panneau"><h3>Courbes des mesures</h3><div class="chartbox"><canvas id="graphe"></canvas></div><p class="muted">Axe horizontal : heure réelle de réception. Entre deux messages, les dernières valeurs restent affichées dans les cartes.</p></section>
+<section class="panneau"><h3>Réglage et acquittement</h3><div class="actions"><label>Seuil alarme (°C) <input id="seuilAlarme" type="number" min="-40" max="80" step="0.1" value="30"></label><button id="envoyerSeuil">Appliquer le seuil</button><button id="acquitter">Acquitter l'alarme</button></div><p class="muted" id="confirmation">Le seuil est envoyé via MQTT. Un acquittement coupe le buzzer mais maintient la LED rouge tant que la température dépasse le seuil.</p></section>
+<section class="panneau"><h3>Commandes et export</h3><div class="actions"><button onclick="cmd('led=on')">LED ON</button><button onclick="cmd('led=off')">LED OFF</button><button onclick="cmd('interval=2000')">Envoi min. 2 s</button><button onclick="cmd('interval=10000')">Envoi min. 10 s</button><button onclick="exporterCSV()">Exporter CSV</button></div></section>
+<section class="panneau"><h3>Historique des publications</h3><table><thead><tr><th>Heure</th><th>T (°C)</th><th>H (%)</th><th>Lum. (%)</th><th>Alarme</th></tr></thead><tbody id="journal"></tbody></table></section>
+</main>
+<script>
+// Configurez ici le mot de passe du compte MQTT autorisé à accéder à la station.
+// Attention : une page HTML statique expose les identifiants MQTT dans le navigateur.
+const BROKER_URL = 'wss://q62d1773.ala.eu-central-1.emqxsl.com:8084/mqtt';
+const USER = 'web-dashboard';
+const PASS = 'Limite0*';
+const BASE = 'unh/meteo/station1/';
+const historique = [];
+let dernier = null;
+let alarmeActive = false;
+let alarmeAcquittee = false;
+let dernierMessage = 0;
+
+const etat = (id,txt,ok) => {const el=document.getElementById(id);el.textContent=txt;el.className='etat '+(ok?'ok':'ko')};
+const graphe = new Chart(document.getElementById('graphe'),{
+ type:'line',data:{datasets:[
+ {label:'Température (°C)',data:[],borderColor:'#dc2626',backgroundColor:'#dc2626',stepped:'after',yAxisID:'y',pointRadius:3},
+ {label:'Humidité (%)',data:[],borderColor:'#2563eb',backgroundColor:'#2563eb',stepped:'after',yAxisID:'y1',pointRadius:3},
+ {label:'Luminosité (%)',data:[],borderColor:'#16a34a',backgroundColor:'#16a34a',stepped:'after',yAxisID:'y1',pointRadius:3}]},
+ options:{responsive:true,maintainAspectRatio:false,animation:false,parsing:false,scales:{
+ x:{type:'linear',ticks:{callback:v=>new Date(Number(v)).toLocaleTimeString('fr-FR')},title:{display:true,text:'Heure de réception'}},
+ y:{position:'left',title:{display:true,text:'°C'}},y1:{position:'right',min:0,max:100,title:{display:true,text:'%'},grid:{drawOnChartArea:false}}
+ }}
+});
+const client=mqtt.connect(BROKER_URL,{username:USER,password:PASS,clientId:'web-'+Math.random().toString(16).slice(2,10),reconnectPeriod:3000,connectTimeout:10000});
+client.on('connect',()=>{etat('broker','connecté',true);client.subscribe([BASE+'data',BASE+'status',BASE+'alarme'],err=>{if(err)console.error('Abonnement :',err);else console.log('Abonnements MQTT OK')})});
+client.on('close',()=>etat('broker','déconnecté',false));
+client.on('error',err=>{console.error(err);etat('broker','erreur',false)});
+function bannir(){
+ const b=document.getElementById('banniere');b.hidden=!alarmeActive;
+ document.getElementById('descriptionAlarme').textContent=`Température au-dessus de ${document.getElementById('seuilAlarme').value} °C`;
+ document.getElementById('etatAcquittement').textContent=alarmeAcquittee?'— acquittée (LED fixe)':'— buzzer actif';
+}
+function chiffre(val){const n=Number(val);return Number.isFinite(n)?n:null}
+client.on('message',(topic,message)=>{
+ const txt=message.toString();console.log('MQTT',topic,txt);
+ if(topic===BASE+'status'){etat('station',txt,txt.trim()==='online');return}
+ try{
+  const d=JSON.parse(txt);
+  if(topic===BASE+'alarme'){
+   alarmeActive=d.alarme===true;alarmeAcquittee=d.acquittee===true;
+   if(chiffre(d.seuil)!==null)document.getElementById('seuilAlarme').value=Number(d.seuil);
+   bannir();return;
+  }
+  if(topic!==BASE+'data')return;
+  const t=chiffre(d.t??d.temperature),h=chiffre(d.h??d.humidity),lum=chiffre(d.lum),hi=chiffre(d.hi),dp=chiffre(d.dp);
+  if(t===null||h===null){console.error('JSON incomplet :',d);return}
+  dernier={heure:new Date().toLocaleTimeString('fr-FR'),t,h,lum,hi,dp,alarme:d.alarme===true};
+  dernierMessage=Date.now();historique.push(dernier);
+  for(const [id,val] of Object.entries({t,h,lum,hi,dp})){document.getElementById(id).textContent=val===null?'--':val.toFixed(1)}
+  const valeurs=[t,h,lum],x=Date.now();
+  graphe.data.datasets.forEach((ds,i)=>{if(valeurs[i]!==null){ds.data.push({x,y:valeurs[i]});if(ds.data.length>120)ds.data.shift()}});
+  graphe.update();
+  // L'alarme a aussi son propre topic : celui-ci est prioritaire pour l'acquittement.
+  if(d.alarme===true&&!alarmeActive){alarmeActive=true;alarmeAcquittee=false;bannir()}
+  else if(d.alarme===false&&alarmeActive){alarmeActive=false;alarmeAcquittee=false;bannir()}
+  const tb=document.getElementById('journal');const tr=tb.insertRow(0);
+  [dernier.heure,t.toFixed(1),h.toFixed(1),lum===null?'--':lum.toFixed(1),dernier.alarme?'OUI':'NON'].forEach(v=>{const td=tr.insertCell();td.textContent=v});
+  if(tb.rows.length>15)tb.deleteRow(-1);
+ }catch(err){console.error('Message invalide :',err)}
+});
+function cmd(texte){if(!client.connected){alert('MQTT déconnecté');return}client.publish(BASE+'cmd',texte,{},err=>{if(err)console.error(err);else console.log('Commande envoyée',texte)})}
+document.getElementById('envoyerSeuil').onclick=()=>{
+ const v=Number(document.getElementById('seuilAlarme').value);
+ if(!Number.isFinite(v)||v< -40||v>80){alert('Seuil entre -40 et 80 °C');return}
+ cmd('seuil_alarme='+v);document.getElementById('confirmation').textContent='Commande de seuil envoyée : '+v+' °C (à confirmer sur le moniteur série ESP32)';
+};
+document.getElementById('acquitter').onclick=()=>cmd('alarme=acquitter');
+function exporterCSV(){const lignes=['heure;temperature;humidite;luminosite;ressenti;rosee;alarme'].concat(historique.map(r=>[r.heure,r.t,r.h,r.lum??'',r.hi??'',r.dp??'',r.alarme].join(';')));const blob=new Blob([lignes.join('\n')],{type:'text/csv;charset=utf-8'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='releves_meteo.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)}
+</script></body></html>
